@@ -1,0 +1,10 @@
+**Cargo.lock
+**target/
+**__pycache__/
+docs/
+.venv/
+.pytest_cache/
+.mypy_cache/
+*.py[cod]
+tc-server/examples/*.wasm
+python*-shared/
