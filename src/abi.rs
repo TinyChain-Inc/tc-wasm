@@ -1,9 +1,12 @@
 use bytes::Bytes;
+use destream::{
+    de,
+    en::{self, EncodeMap, EncodeSeq},
+};
 use futures::{TryStreamExt, executor::block_on, stream};
-use serde_json::json;
 use std::{io, mem, slice};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Library, Transaction, TxnHeader};
+use tc_ir::{Library, LibrarySchema, Transaction, TxnHeader};
 use tc_value::Value;
 
 /// Routes exported by a WASM library (path -> wasm export name).
@@ -16,6 +19,15 @@ pub struct RouteExport {
 impl RouteExport {
     pub const fn new(path: &'static str, export: &'static str) -> Self {
         Self { path, export }
+    }
+}
+
+impl<'en> en::IntoStream<'en> for RouteExport {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let mut map = encoder.encode_map(Some(2))?;
+        map.encode_entry("path", self.path)?;
+        map.encode_entry("export", self.export)?;
+        map.end()
     }
 }
 
@@ -37,11 +49,10 @@ impl WasmRequest for String {
             return Ok(String::new());
         }
 
-        match serde_json::from_slice::<serde_json::Value>(bytes) {
-            Ok(serde_json::Value::String(s)) => Ok(s),
-            Ok(other) => Ok(other.to_string()),
-            Err(_) => Ok(String::from_utf8(bytes.to_vec())
-                .map_err(|err| TCError::bad_request(format!("invalid utf-8 string: {err}")))?),
+        match try_decode_json_slice((), bytes) {
+            Ok(value) => Ok(value),
+            Err(_) => String::from_utf8(bytes.to_vec())
+                .map_err(|err| TCError::bad_request(format!("invalid utf-8 string: {err}"))),
         }
     }
 }
@@ -52,60 +63,35 @@ impl WasmRequest for Value {
             return Ok(Value::None);
         }
 
-        let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
-        block_on(destream_json::try_decode((), stream))
-            .map_err(|err| TCError::bad_request(err.to_string()))
+        try_decode_json_slice((), bytes).map_err(TCError::bad_request)
     }
 }
 
 impl WasmResponse for String {
     fn encode(self) -> TCResult<Vec<u8>> {
-        serde_json::to_vec(&json!(self)).map_err(|err| TCError::bad_request(err.to_string()))
+        encode_json_bytes(self)
     }
 }
 
 impl WasmResponse for Value {
     fn encode(self) -> TCResult<Vec<u8>> {
-        let stream =
-            destream_json::encode(self).map_err(|err| TCError::bad_request(err.to_string()))?;
-        let bytes = block_on(stream.try_fold(Vec::new(), |mut acc, chunk| async move {
-            acc.extend_from_slice(&chunk);
-            Ok(acc)
-        }))
-        .map_err(|err| TCError::bad_request(err.to_string()))?;
-        Ok(bytes)
+        encode_json_bytes(self)
     }
 }
 
 impl WasmResponse for () {
     fn encode(self) -> TCResult<Vec<u8>> {
-        serde_json::to_vec(&serde_json::Value::Null)
-            .map_err(|err| TCError::bad_request(err.to_string()))
+        encode_json_bytes(())
     }
 }
 
 pub fn manifest_bytes<L: Library>(library: &L, routes: &[RouteExport]) -> Vec<u8> {
-    let schema = library.schema();
-    let deps: Vec<String> = schema
-        .dependencies()
-        .iter()
-        .map(|link| link.to_string())
-        .collect();
+    let payload = ManifestPayload {
+        schema: library.schema().clone(),
+        routes: routes.to_vec(),
+    };
 
-    let routes_json: Vec<_> = routes
-        .iter()
-        .map(|route| json!({ "path": route.path, "export": route.export }))
-        .collect();
-
-    serde_json::to_vec(&json!({
-        "schema": {
-            "id": schema.id().to_string(),
-            "version": schema.version(),
-            "dependencies": deps,
-        },
-        "routes": routes_json,
-    }))
-    .expect("manifest json")
+    encode_json_bytes(payload).expect("manifest json")
 }
 
 pub fn alloc(len: i32) -> i32 {
@@ -140,6 +126,81 @@ pub fn leak_bytes(bytes: Vec<u8>) -> (i32, i32) {
     (ptr, len)
 }
 
+struct ManifestPayload {
+    schema: LibrarySchema,
+    routes: Vec<RouteExport>,
+}
+
+impl<'en> en::IntoStream<'en> for ManifestPayload {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let mut map = encoder.encode_map(Some(2))?;
+        map.encode_entry("schema", self.schema)?;
+        map.encode_entry(
+            "routes",
+            ManifestRoutes {
+                routes: self.routes,
+            },
+        )?;
+        map.end()
+    }
+}
+
+struct ManifestRoutes {
+    routes: Vec<RouteExport>,
+}
+
+impl<'en> en::IntoStream<'en> for ManifestRoutes {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let mut seq = encoder.encode_seq(Some(self.routes.len()))?;
+        for route in self.routes {
+            seq.encode_element(route)?;
+        }
+        seq.end()
+    }
+}
+
+struct ErrorPayload {
+    message: String,
+}
+
+impl<'en> en::IntoStream<'en> for ErrorPayload {
+    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
+        let mut map = encoder.encode_map(Some(1))?;
+        map.encode_entry("error", self.message)?;
+        map.end()
+    }
+}
+
+fn encode_json_bytes<T>(value: T) -> TCResult<Vec<u8>>
+where
+    T: for<'en> en::IntoStream<'en>,
+{
+    let stream =
+        destream_json::encode(value).map_err(|err| TCError::bad_request(err.to_string()))?;
+    block_on(stream.try_fold(Vec::new(), |mut acc, chunk| async move {
+        acc.extend_from_slice(&chunk);
+        Ok(acc)
+    }))
+    .map_err(|err| TCError::bad_request(err.to_string()))
+}
+
+fn decode_json_bytes<T>(context: T::Context, bytes: Vec<u8>) -> TCResult<T>
+where
+    T: de::FromStream,
+{
+    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
+    block_on(destream_json::try_decode(context, stream))
+        .map_err(|err| TCError::bad_request(err.to_string()))
+}
+
+fn try_decode_json_slice<T>(context: T::Context, bytes: &[u8]) -> Result<T, String>
+where
+    T: de::FromStream,
+{
+    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
+    block_on(destream_json::try_decode(context, stream)).map_err(|err| err.to_string())
+}
+
 fn read_bytes(ptr: i32, len: i32) -> Vec<u8> {
     if ptr == 0 || len <= 0 {
         return Vec::new();
@@ -154,14 +215,14 @@ fn decode_header(ptr: i32, len: i32) -> TCResult<TxnHeader> {
         return Err(TCError::bad_request("missing transaction header"));
     }
 
-    let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    block_on(destream_json::try_decode((), stream))
-        .map_err(|err| TCError::bad_request(err.to_string()))
+    decode_json_bytes((), bytes)
 }
 
 fn encode_error(err: TCError) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "error": err.to_string() }))
-        .unwrap_or_else(|_| br#"{"error":"internal"}"#.to_vec())
+    encode_json_bytes(ErrorPayload {
+        message: err.to_string(),
+    })
+    .unwrap_or_else(|_| br#"{"error":"internal"}"#.to_vec())
 }
 
 pub fn dispatch_get<H, Txn, Req, Res>(
