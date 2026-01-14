@@ -115,7 +115,7 @@ mod wasm_example {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn tc_library_entry() -> (i32, i32) {
+    pub extern "C" fn tc_library_entry() -> i64 {
         tc_wasm::leak_bytes(manifest_bytes(&*LIBRARY, ROUTES))
     }
 
@@ -125,7 +125,7 @@ mod wasm_example {
         header_len: i32,
         body_ptr: i32,
         body_len: i32,
-    ) -> (i32, i32) {
+    ) -> i64 {
         dispatch_get::<_, ExampleTxn, String, String>(
             &*HELLO_HANDLER,
             header_ptr,

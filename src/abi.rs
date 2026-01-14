@@ -111,19 +111,28 @@ pub fn free(ptr: i32, len: i32) {
     }
 
     unsafe {
-        let _ = Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
+        drop(Box::from_raw(slice::from_raw_parts_mut(
+            ptr as *mut u8,
+            len as usize,
+        )));
     }
 }
 
-pub fn leak_bytes(bytes: Vec<u8>) -> (i32, i32) {
+fn pack_wasm_pair(ptr: i32, len: i32) -> i64 {
+    let ptr = ptr as u32 as u64;
+    let len = len as u32 as u64;
+    ((len << 32) | ptr) as i64
+}
+
+pub fn leak_bytes(bytes: Vec<u8>) -> i64 {
     if bytes.is_empty() {
-        return (0, 0);
+        return 0;
     }
 
-    let len = bytes.len() as i32;
-    let ptr = bytes.as_ptr() as i32;
-    mem::forget(bytes);
-    (ptr, len)
+    let boxed = bytes.into_boxed_slice();
+    let len = boxed.len() as i32;
+    let ptr = Box::into_raw(boxed) as *mut u8 as i32;
+    pack_wasm_pair(ptr, len)
 }
 
 struct ManifestPayload {
@@ -231,7 +240,7 @@ pub fn dispatch_get<H, Txn, Req, Res>(
     header_len: i32,
     body_ptr: i32,
     body_len: i32,
-) -> (i32, i32)
+) -> i64
 where
     Txn: WasmTransaction,
     H: tc_ir::HandleGet<Txn, Request = Req, RequestContext = (), Response = Res, Error = TCError>,
