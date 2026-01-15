@@ -27,7 +27,7 @@ This produces `target/wasm32-unknown-unknown/release/examples/hello_wasm.wasm`, 
 exports:
 
 - `tc_library_entry` – uses `manifest_bytes` + `RouteExport` to generate the manifest JSON
-  describing `/library/example` with a single `/hello` route.
+  describing `/lib/example` with a single `/hello` route.
 - `alloc` / `free` – provided by `tc_wasm::abi` so every library shares the same
   host-memory helpers.
 - `hello` – the actual TinyChain handler implemented via `HelloHandler`. It decodes the

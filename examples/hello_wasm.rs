@@ -31,7 +31,7 @@ mod wasm_example {
         fn new() -> Self {
             let id = TxnId::from_parts(NetworkTime::from_nanos(42), 0);
             let claim = Claim::new(
-                Link::from_str("/library/example").expect("schema link"),
+                Link::from_str("/lib/example").expect("schema link"),
                 Mode::all(),
             );
             let header = TxnHeader::new(id, id.timestamp(), claim);
@@ -87,7 +87,7 @@ mod wasm_example {
 
     fn hello_library() -> TCResult<HelloLibrary> {
         let schema = LibrarySchema::new(
-            Link::from_str("/library/example").expect("schema link"),
+            Link::from_str("/lib/example").expect("schema link"),
             "0.1.0",
             vec![],
         );
