@@ -23,7 +23,3 @@ once_cell = "1"
 name = "hello_wasm"
 path = "examples/hello_wasm.rs"
 crate-type = ["cdylib"]
-
-[patch.crates-io]
-destream = { path = "../deps/destream" }
-destream_json = { path = "../deps/destream_json" }
