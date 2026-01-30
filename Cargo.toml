@@ -11,7 +11,7 @@ destream_json = "0.15"
 pathlink = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tc-error = { path = "../tc-error" }
+tc-error = "0.13"
 tc-ir = { path = "../tc-ir" }
 tc-value = { path = "../tc-value" }
 umask = "2.1"
