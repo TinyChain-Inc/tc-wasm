@@ -76,7 +76,7 @@ mod wasm_example {
 
     fn hello_library() -> TCResult<HelloLibrary> {
         let schema = LibrarySchema::new(
-            Link::from_str("/lib/example").expect("schema link"),
+            Link::from_str("/lib/example-devco/example/0.1.0").expect("schema link"),
             "0.1.0",
             vec![],
         );
