@@ -111,7 +111,7 @@ pub fn free(ptr: i32, len: i32) {
     }
 
     unsafe {
-        drop(Box::from_raw(slice::from_raw_parts_mut(
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
             ptr as *mut u8,
             len as usize,
         )));

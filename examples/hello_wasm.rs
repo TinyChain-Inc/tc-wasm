@@ -12,15 +12,14 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 mod wasm_example {
     use once_cell::sync::Lazy;
-    use std::str::FromStr;
     use pathlink::Link;
+    use std::str::FromStr;
     use tc_error::{TCError, TCResult};
     use tc_ir::{
         Claim, Dir, HandleGet, LibrarySchema, NetworkTime, StaticLibrary, Transaction, TxnHeader,
         TxnId, tc_library_routes,
     };
     use tc_wasm::{RouteExport, WasmTransaction, dispatch_get, manifest_bytes};
-    use umask::Mode;
 
     #[derive(Clone)]
     struct ExampleTxn {
@@ -28,16 +27,6 @@ mod wasm_example {
     }
 
     impl ExampleTxn {
-        fn new() -> Self {
-            let id = TxnId::from_parts(NetworkTime::from_nanos(42), 0);
-            let claim = Claim::new(
-                Link::from_str("/lib/example").expect("schema link"),
-                Mode::all(),
-            );
-            let header = TxnHeader::new(id, id.timestamp(), claim);
-            Self { header }
-        }
-
         fn from_header(header: TxnHeader) -> Self {
             Self { header }
         }
@@ -120,12 +109,7 @@ mod wasm_example {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn hello(
-        header_ptr: i32,
-        header_len: i32,
-        body_ptr: i32,
-        body_len: i32,
-    ) -> i64 {
+    pub extern "C" fn hello(header_ptr: i32, header_len: i32, body_ptr: i32, body_len: i32) -> i64 {
         dispatch_get::<_, ExampleTxn, String, String>(
             &*HELLO_HANDLER,
             header_ptr,
