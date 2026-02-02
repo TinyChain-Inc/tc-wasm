@@ -6,7 +6,7 @@ use destream::{
 use futures::{TryStreamExt, executor::block_on, stream};
 use std::{io, mem, slice};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Library, LibrarySchema, Transaction, TxnHeader};
+use tc_ir::{Library, LibrarySchema, OpRef, TCRef, Transaction, TxnHeader};
 use tc_value::Value;
 
 /// Routes exported by a WASM library (path -> wasm export name).
@@ -82,6 +82,18 @@ impl WasmResponse for Value {
 impl WasmResponse for () {
     fn encode(self) -> TCResult<Vec<u8>> {
         encode_json_bytes(())
+    }
+}
+
+impl WasmResponse for OpRef {
+    fn encode(self) -> TCResult<Vec<u8>> {
+        encode_json_bytes(self)
+    }
+}
+
+impl WasmResponse for TCRef {
+    fn encode(self) -> TCResult<Vec<u8>> {
+        encode_json_bytes(self)
     }
 }
 

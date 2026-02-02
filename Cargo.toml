@@ -23,3 +23,8 @@ once_cell = "1"
 name = "hello_wasm"
 path = "examples/hello_wasm.rs"
 crate-type = ["cdylib"]
+
+[[example]]
+name = "opref_to_remote"
+path = "examples/opref_to_remote.rs"
+crate-type = ["cdylib"]
