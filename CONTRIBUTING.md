@@ -15,22 +15,23 @@ WASM-published libraries behave the same way as their native counterparts.
 
 ## Contribution workflow
 
-1. Follow the top-level TinyChain contributing guide for discussion channels,
-   pull request expectations, and environment setup.
-2. Apply the repo-wide style rules in `/CODE_STYLE.md` (grouped imports, `cargo fmt`,
-   `cargo clippy --all-targets --all-features -D warnings`) before sending patches.
+1. Align proposed changes with `AGENTS.md` in this repository (keep the ABI and
+   manifest contract stable, avoid dependency bloat).
+2. Keep formatting and linting clean: run `cargo fmt` and
+   `cargo clippy --all-targets --all-features -D warnings` before sending
+   patches.
 3. Keep dependencies lean; this crate must stay small so every adapter can embed
    it without bloating WASM builds.
 4. Run `cargo test -p tc-wasm` (and any relevant downstream tests) before
    opening a PR so manifest generation and example flows stay healthy.
 5. Document observable behavior changes in `README.md` so library authors know
-  how host/runtime contracts evolved.
+   how host/runtime contracts evolved.
 
 ## Rights and licensing
 
 By contributing to this crate you represent that (a) the work is authored by
-you (or you have the necessary rights to contribute it) and (b) you transfer and
-assign all right, title, and interest in the contribution to the TinyChain
-Open-Source Project for distribution under the TinyChain open-source license
-(Apache 2.0, see the root `LICENSE`). No other restrictions or encumbrances may
-attach to your contribution.
+you (or you have the necessary rights to contribute it), (b) the contribution is
+unencumbered by third-party intellectual property claims, and (c) you transfer
+and assign all right, title, and interest in the contribution to The TinyChain
+Contributors for distribution under the Apache 2.0 license (see `LICENSE`). No
+other restrictions or encumbrances may attach to your contribution.

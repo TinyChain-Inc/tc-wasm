@@ -34,8 +34,8 @@ exports:
   JSON body into a Rust `String`, invokes the same `HandleGet` logic shown in the
   `tc-ir` example, and serializes the response back to JSON.
 
-Install the resulting module via `/lib` (or `client/py/bin/install_wasm.py`) the same as
-any other TinyChain WASM artifact.
+Install the resulting module via `/lib` (or the TinyChain Python client WASM
+installer helper) the same as any other TinyChain WASM artifact.
 
 To wrap your own library crate, expose a `StaticLibrary`, implement `WasmTransaction`
 for your transaction type (i.e., rebuild it from a `TxnHeader`), and export each route
