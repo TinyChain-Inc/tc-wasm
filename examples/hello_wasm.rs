@@ -19,6 +19,7 @@ mod wasm_example {
         Claim, Dir, HandleGet, LibrarySchema, NetworkTime, StaticLibrary, Transaction, TxnHeader,
         TxnId, tc_library_routes,
     };
+    use tc_value::Value;
     use tc_wasm::{RouteExport, WasmTransaction, dispatch_get, manifest_bytes};
 
     #[derive(Clone)]
@@ -55,9 +56,9 @@ mod wasm_example {
     struct HelloHandler;
 
     impl HandleGet<ExampleTxn> for HelloHandler {
-        type Request = String;
+        type Request = Value;
         type RequestContext = ();
-        type Response = String;
+        type Response = Value;
         type Error = TCError;
         type Fut<'a> = std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>,
@@ -68,7 +69,11 @@ mod wasm_example {
             _txn: &'a ExampleTxn,
             request: Self::Request,
         ) -> TCResult<Self::Fut<'a>> {
-            Ok(Box::pin(async move { Ok(format!("Hello, {request}!")) }))
+            let response = match request {
+                Value::String(name) => Value::String(format!("Hello, {name}!")),
+                _ => Value::String("Hello, World!".to_string()),
+            };
+            Ok(Box::pin(async move { Ok(response) }))
         }
     }
 
@@ -110,7 +115,7 @@ mod wasm_example {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn hello(header_ptr: i32, header_len: i32, body_ptr: i32, body_len: i32) -> i64 {
-        dispatch_get::<_, ExampleTxn, String, String>(
+        dispatch_get::<_, ExampleTxn, Value, Value>(
             &*HELLO_HANDLER,
             header_ptr,
             header_len,
