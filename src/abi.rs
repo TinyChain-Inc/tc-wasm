@@ -230,13 +230,12 @@ fn read_bytes(ptr: i32, len: i32) -> Vec<u8> {
     unsafe { slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() }
 }
 
-fn decode_header(ptr: i32, len: i32) -> TCResult<TxnHeader> {
-    let bytes = read_bytes(ptr, len);
+fn decode_header_bytes(bytes: &[u8]) -> TCResult<TxnHeader> {
     if bytes.is_empty() {
         return Err(TCError::bad_request("missing transaction header"));
     }
 
-    decode_json_bytes((), bytes)
+    decode_json_bytes((), bytes.to_vec())
 }
 
 fn encode_error(err: TCError) -> Vec<u8> {
@@ -246,43 +245,269 @@ fn encode_error(err: TCError) -> Vec<u8> {
     .unwrap_or_else(|_| br#"{"error":"internal"}"#.to_vec())
 }
 
-pub fn dispatch_get<H, Txn, Req, Res>(
-    handler: &H,
-    header_ptr: i32,
-    header_len: i32,
-    body_ptr: i32,
-    body_len: i32,
-) -> i64
-where
-    Txn: WasmTransaction,
-    H: tc_ir::HandleGet<Txn, Request = Req, RequestContext = (), Response = Res, Error = TCError>,
-    Req: WasmRequest,
-    Res: WasmResponse,
-{
-    let result = try_dispatch_get(handler, header_ptr, header_len, body_ptr, body_len);
-    match result {
-        Ok(bytes) => leak_bytes(bytes),
-        Err(err) => leak_bytes(encode_error(err)),
-    }
+macro_rules! define_dispatch {
+    (
+        $dispatch_fn:ident,
+        $try_dispatch_fn:ident,
+        $try_dispatch_bytes_fn:ident,
+        $handler_trait:ident,
+        $handler_method:ident,
+    ) => {
+        pub fn $dispatch_fn<H, Txn, Req, Res>(
+            handler: &H,
+            header_ptr: i32,
+            header_len: i32,
+            body_ptr: i32,
+            body_len: i32,
+        ) -> i64
+        where
+            Txn: WasmTransaction,
+            H: tc_ir::$handler_trait<
+                    Txn,
+                    Request = Req,
+                    RequestContext = (),
+                    Response = Res,
+                    Error = TCError,
+                >,
+            Req: WasmRequest,
+            Res: WasmResponse,
+        {
+            let result = $try_dispatch_fn(handler, header_ptr, header_len, body_ptr, body_len);
+            match result {
+                Ok(bytes) => leak_bytes(bytes),
+                Err(err) => leak_bytes(encode_error(err)),
+            }
+        }
+
+        fn $try_dispatch_fn<H, Txn, Req, Res>(
+            handler: &H,
+            header_ptr: i32,
+            header_len: i32,
+            body_ptr: i32,
+            body_len: i32,
+        ) -> TCResult<Vec<u8>>
+        where
+            Txn: WasmTransaction,
+            H: tc_ir::$handler_trait<
+                    Txn,
+                    Request = Req,
+                    RequestContext = (),
+                    Response = Res,
+                    Error = TCError,
+                >,
+            Req: WasmRequest,
+            Res: WasmResponse,
+        {
+            let header_bytes = read_bytes(header_ptr, header_len);
+            let body_bytes = read_bytes(body_ptr, body_len);
+            $try_dispatch_bytes_fn(handler, &header_bytes, &body_bytes)
+        }
+
+        fn $try_dispatch_bytes_fn<H, Txn, Req, Res>(
+            handler: &H,
+            header_bytes: &[u8],
+            body_bytes: &[u8],
+        ) -> TCResult<Vec<u8>>
+        where
+            Txn: WasmTransaction,
+            H: tc_ir::$handler_trait<
+                    Txn,
+                    Request = Req,
+                    RequestContext = (),
+                    Response = Res,
+                    Error = TCError,
+                >,
+            Req: WasmRequest,
+            Res: WasmResponse,
+        {
+            let header = decode_header_bytes(header_bytes)?;
+            let txn = Txn::from_wasm_header(header)?;
+            let request = Req::decode(body_bytes)?;
+            let fut = handler.$handler_method(&txn, request)?;
+            let response = block_on(fut)?;
+            response.encode()
+        }
+    };
 }
 
-fn try_dispatch_get<H, Txn, Req, Res>(
-    handler: &H,
-    header_ptr: i32,
-    header_len: i32,
-    body_ptr: i32,
-    body_len: i32,
-) -> TCResult<Vec<u8>>
-where
-    Txn: WasmTransaction,
-    H: tc_ir::HandleGet<Txn, Request = Req, RequestContext = (), Response = Res, Error = TCError>,
-    Req: WasmRequest,
-    Res: WasmResponse,
-{
-    let header = decode_header(header_ptr, header_len)?;
-    let txn = Txn::from_wasm_header(header)?;
-    let request = Req::decode(&read_bytes(body_ptr, body_len))?;
-    let fut = handler.get(&txn, request)?;
-    let response = block_on(fut)?;
-    response.encode()
+define_dispatch!(
+    dispatch_get,
+    try_dispatch_get,
+    try_dispatch_get_bytes,
+    HandleGet,
+    get,
+);
+
+define_dispatch!(
+    dispatch_put,
+    try_dispatch_put,
+    try_dispatch_put_bytes,
+    HandlePut,
+    put,
+);
+
+define_dispatch!(
+    dispatch_post,
+    try_dispatch_post,
+    try_dispatch_post_bytes,
+    HandlePost,
+    post,
+);
+
+define_dispatch!(
+    dispatch_delete,
+    try_dispatch_delete,
+    try_dispatch_delete_bytes,
+    HandleDelete,
+    delete,
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::Future;
+    use pathlink::Link;
+    use std::{pin::Pin, str::FromStr};
+    use tc_ir::{Claim, NetworkTime, TxnHeader, TxnId};
+    use umask::Mode;
+
+    #[derive(Clone)]
+    struct FakeTxn {
+        header: TxnHeader,
+    }
+
+    impl tc_ir::Transaction for FakeTxn {
+        fn id(&self) -> TxnId {
+            self.header.id()
+        }
+
+        fn timestamp(&self) -> NetworkTime {
+            self.header.timestamp()
+        }
+
+        fn claim(&self) -> &Claim {
+            self.header.claim()
+        }
+    }
+
+    impl WasmTransaction for FakeTxn {
+        fn from_wasm_header(header: TxnHeader) -> TCResult<Self> {
+            Ok(Self { header })
+        }
+    }
+
+    struct VerbHandler;
+
+    impl tc_ir::HandlePut<FakeTxn> for VerbHandler {
+        type Request = Value;
+        type RequestContext = ();
+        type Response = Value;
+        type Error = TCError;
+        type Fut<'a> =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+
+        fn put<'a>(&'a self, _txn: &'a FakeTxn, request: Self::Request) -> TCResult<Self::Fut<'a>> {
+            Ok(Box::pin(async move { Ok(request) }))
+        }
+    }
+
+    impl tc_ir::HandlePost<FakeTxn> for VerbHandler {
+        type Request = Value;
+        type RequestContext = ();
+        type Response = Value;
+        type Error = TCError;
+        type Fut<'a> =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+
+        fn post<'a>(
+            &'a self,
+            _txn: &'a FakeTxn,
+            request: Self::Request,
+        ) -> TCResult<Self::Fut<'a>> {
+            Ok(Box::pin(async move {
+                Ok(Value::String(format!("post:{request:?}")))
+            }))
+        }
+    }
+
+    impl tc_ir::HandleDelete<FakeTxn> for VerbHandler {
+        type Request = Value;
+        type RequestContext = ();
+        type Response = Value;
+        type Error = TCError;
+        type Fut<'a> =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+
+        fn delete<'a>(
+            &'a self,
+            _txn: &'a FakeTxn,
+            request: Self::Request,
+        ) -> TCResult<Self::Fut<'a>> {
+            Ok(Box::pin(async move {
+                Ok(Value::String(format!("delete:{request:?}")))
+            }))
+        }
+    }
+
+    fn txn_header_bytes() -> Vec<u8> {
+        let claim = Claim::new(Link::from_str("/lib").expect("claim link"), Mode::all());
+        let id = TxnId::from_parts(NetworkTime::from_nanos(1), 7);
+        let header = TxnHeader::new(id, NetworkTime::from_nanos(1), claim);
+        encode_json_bytes(header).expect("header json")
+    }
+
+    #[test]
+    fn dispatch_put_works() {
+        let handler = VerbHandler;
+        let header_bytes = txn_header_bytes();
+        let request = Value::from(42u64);
+        let body_bytes = encode_json_bytes(request.clone()).expect("body json");
+
+        let response_bytes = try_dispatch_put_bytes::<_, FakeTxn, Value, Value>(
+            &handler,
+            &header_bytes,
+            &body_bytes,
+        )
+        .expect("put response");
+
+        let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
+        assert_eq!(response, request);
+    }
+
+    #[test]
+    fn dispatch_post_works() {
+        let handler = VerbHandler;
+        let header_bytes = txn_header_bytes();
+        let request = Value::from("hello");
+        let body_bytes = encode_json_bytes(request.clone()).expect("body json");
+
+        let response_bytes = try_dispatch_post_bytes::<_, FakeTxn, Value, Value>(
+            &handler,
+            &header_bytes,
+            &body_bytes,
+        )
+        .expect("post response");
+
+        let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
+        assert_eq!(response, Value::String(format!("post:{request:?}")));
+    }
+
+    #[test]
+    fn dispatch_delete_works() {
+        let handler = VerbHandler;
+        let header_bytes = txn_header_bytes();
+        let request = Value::from("goodbye");
+        let body_bytes = encode_json_bytes(request.clone()).expect("body json");
+
+        let response_bytes = try_dispatch_delete_bytes::<_, FakeTxn, Value, Value>(
+            &handler,
+            &header_bytes,
+            &body_bytes,
+        )
+        .expect("delete response");
+
+        let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
+        assert_eq!(response, Value::String(format!("delete:{request:?}")));
+    }
 }

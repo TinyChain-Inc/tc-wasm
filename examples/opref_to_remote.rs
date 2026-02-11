@@ -41,7 +41,10 @@ mod wasm_example {
 
         fn claim(&self) -> &Claim {
             static CLAIM: Lazy<Claim> = Lazy::new(|| {
-                Claim::new(Link::from_str(A_ROOT).expect("claim link"), Mode::from(0u32))
+                Claim::new(
+                    Link::from_str(A_ROOT).expect("claim link"),
+                    Mode::from(0u32),
+                )
             });
             &CLAIM
         }
