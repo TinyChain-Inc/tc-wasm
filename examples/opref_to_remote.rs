@@ -26,6 +26,7 @@ mod wasm_example {
     const A_ROOT: &str = "/lib/example-devco/a/0.1.0";
     const B_ROOT: &str = "/lib/example-devco/example/0.1.0";
     const B_HELLO: &str = "/lib/example-devco/example/0.1.0/hello";
+    const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
 
     #[derive(Clone)]
     struct NoopTxn;
@@ -59,6 +60,7 @@ mod wasm_example {
     type Library = StaticLibrary<NoopTxn, Dir<()>>;
 
     struct FromBHandler;
+    struct AuthContextHandler;
 
     impl HandleGet<NoopTxn> for FromBHandler {
         type Request = Value;
@@ -78,6 +80,27 @@ mod wasm_example {
         }
     }
 
+    impl HandleGet<NoopTxn> for AuthContextHandler {
+        type Request = Value;
+        type RequestContext = ();
+        type Response = OpRef;
+        type Error = tc_error::TCError;
+        type Fut<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>,
+        >;
+
+        fn get<'a>(
+            &'a self,
+            _txn: &'a NoopTxn,
+            _request: Self::Request,
+        ) -> TCResult<Self::Fut<'a>> {
+            Ok(Box::pin(async move {
+                let link = Link::from_str(HOST_AUTH_CONTEXT).expect("HOST_AUTH_CONTEXT link");
+                Ok(OpRef::Get((Subject::Link(link), Scalar::default())))
+            }))
+        }
+    }
+
     fn library() -> TCResult<Library> {
         let schema = LibrarySchema::new(
             Link::from_str(A_ROOT).expect("schema link"),
@@ -89,7 +112,11 @@ mod wasm_example {
 
     static LIBRARY: Lazy<Library> = Lazy::new(|| library().expect("library"));
     static FROM_B_HANDLER: Lazy<FromBHandler> = Lazy::new(|| FromBHandler);
-    const ROUTES: &[RouteExport] = &[RouteExport::new("/from_b", "from_b")];
+    static AUTH_CONTEXT_HANDLER: Lazy<AuthContextHandler> = Lazy::new(|| AuthContextHandler);
+    const ROUTES: &[RouteExport] = &[
+        RouteExport::new("/from_b", "from_b"),
+        RouteExport::new("/auth_context", "auth_context"),
+    ];
 
     #[unsafe(no_mangle)]
     pub extern "C" fn alloc(len: i32) -> i32 {
@@ -115,6 +142,22 @@ mod wasm_example {
     ) -> i64 {
         dispatch_get::<_, NoopTxn, Value, OpRef>(
             &*FROM_B_HANDLER,
+            header_ptr,
+            header_len,
+            body_ptr,
+            body_len,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn auth_context(
+        header_ptr: i32,
+        header_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+    ) -> i64 {
+        dispatch_get::<_, NoopTxn, Value, OpRef>(
+            &*AUTH_CONTEXT_HANDLER,
             header_ptr,
             header_len,
             body_ptr,
