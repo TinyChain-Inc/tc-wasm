@@ -21,7 +21,6 @@ mod wasm_example {
     };
     use tc_value::Value;
     use tc_wasm::{RouteExport, WasmTransaction, dispatch_get, manifest_bytes};
-    use umask::Mode;
 
     const A_ROOT: &str = "/lib/example-devco/a/0.1.0";
     const B_ROOT: &str = "/lib/example-devco/example/0.1.0";
@@ -29,58 +28,36 @@ mod wasm_example {
     const HOST_AUTH_CONTEXT: &str = "/host/auth/context";
 
     #[derive(Clone)]
-    struct NoopTxn;
+    struct ExampleTxn {
+        header: TxnHeader,
+    }
 
-    impl Transaction for NoopTxn {
+    impl Transaction for ExampleTxn {
         fn id(&self) -> TxnId {
-            TxnId::from_parts(NetworkTime::from_nanos(0), 0)
+            self.header.id()
         }
 
         fn timestamp(&self) -> NetworkTime {
-            NetworkTime::from_nanos(0)
+            self.header.timestamp()
         }
 
         fn claim(&self) -> &Claim {
-            static CLAIM: Lazy<Claim> = Lazy::new(|| {
-                Claim::new(
-                    Link::from_str(A_ROOT).expect("claim link"),
-                    Mode::from(0u32),
-                )
-            });
-            &CLAIM
+            self.header.claim()
         }
     }
 
-    impl WasmTransaction for NoopTxn {
-        fn from_wasm_header(_header: TxnHeader) -> TCResult<Self> {
-            Ok(Self)
+    impl WasmTransaction for ExampleTxn {
+        fn from_wasm_header(header: TxnHeader) -> TCResult<Self> {
+            Ok(Self { header })
         }
     }
 
-    type Library = StaticLibrary<NoopTxn, Dir<()>>;
+    type Library = StaticLibrary<ExampleTxn, Dir<()>>;
 
     struct FromBHandler;
     struct AuthContextHandler;
 
-    impl HandleGet<NoopTxn> for FromBHandler {
-        type Request = Value;
-        type RequestContext = ();
-        type Response = OpRef;
-        type Error = tc_error::TCError;
-        type Fut<'a> = std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>,
-        >;
-
-        fn get<'a>(&'a self, _txn: &'a NoopTxn, request: Self::Request) -> TCResult<Self::Fut<'a>> {
-            Ok(Box::pin(async move {
-                let link = Link::from_str(B_HELLO).expect("B_HELLO link");
-                let scalar = Scalar::Value(request);
-                Ok(OpRef::Get((Subject::Link(link), scalar)))
-            }))
-        }
-    }
-
-    impl HandleGet<NoopTxn> for AuthContextHandler {
+    impl HandleGet<ExampleTxn> for FromBHandler {
         type Request = Value;
         type RequestContext = ();
         type Response = OpRef;
@@ -91,7 +68,29 @@ mod wasm_example {
 
         fn get<'a>(
             &'a self,
-            _txn: &'a NoopTxn,
+            _txn: &'a ExampleTxn,
+            request: Self::Request,
+        ) -> TCResult<Self::Fut<'a>> {
+            Ok(Box::pin(async move {
+                let link = Link::from_str(B_HELLO).expect("B_HELLO link");
+                let scalar = Scalar::Value(request);
+                Ok(OpRef::Get((Subject::Link(link), scalar)))
+            }))
+        }
+    }
+
+    impl HandleGet<ExampleTxn> for AuthContextHandler {
+        type Request = Value;
+        type RequestContext = ();
+        type Response = OpRef;
+        type Error = tc_error::TCError;
+        type Fut<'a> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>,
+        >;
+
+        fn get<'a>(
+            &'a self,
+            _txn: &'a ExampleTxn,
             _request: Self::Request,
         ) -> TCResult<Self::Fut<'a>> {
             Ok(Box::pin(async move {
@@ -140,7 +139,7 @@ mod wasm_example {
         body_ptr: i32,
         body_len: i32,
     ) -> i64 {
-        dispatch_get::<_, NoopTxn, Value, OpRef>(
+        dispatch_get::<_, ExampleTxn, Value, OpRef>(
             &*FROM_B_HANDLER,
             header_ptr,
             header_len,
@@ -156,7 +155,7 @@ mod wasm_example {
         body_ptr: i32,
         body_len: i32,
     ) -> i64 {
-        dispatch_get::<_, NoopTxn, Value, OpRef>(
+        dispatch_get::<_, ExampleTxn, Value, OpRef>(
             &*AUTH_CONTEXT_HANDLER,
             header_ptr,
             header_len,
