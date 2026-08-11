@@ -1,12 +1,13 @@
+use std::collections::HashMap;
+use std::io;
+use std::sync::{Mutex, OnceLock};
+
 use bytes::Bytes;
-use destream::{
-    de,
-    en::{self, EncodeMap, EncodeSeq},
-};
-use futures::{TryStreamExt, executor::block_on, stream};
-use std::{io, mem, slice};
+use destream::de;
+use destream::en::{self, EncodeMap, EncodeSeq};
+use futures::{FutureExt, TryStreamExt, stream};
 use tc_error::{TCError, TCResult};
-use tc_ir::{Library, LibrarySchema, OpRef, TCRef, Transaction, TxnHeader};
+use tc_ir::{Library, LibrarySchema, OpRef, TCRef, TxnHeader};
 use tc_value::Value;
 
 /// Routes exported by a WASM library (path -> wasm export name).
@@ -29,10 +30,6 @@ impl<'en> en::IntoStream<'en> for RouteExport {
         map.encode_entry("export", self.export)?;
         map.end()
     }
-}
-
-pub trait WasmTransaction: Transaction + Sized {
-    fn from_wasm_header(header: TxnHeader) -> TCResult<Self>;
 }
 
 pub trait WasmRequest: Sized {
@@ -111,10 +108,7 @@ pub fn alloc(len: i32) -> i32 {
         return 0;
     }
 
-    let mut buffer = vec![0_u8; len as usize];
-    let ptr = buffer.as_mut_ptr() as i32;
-    mem::forget(buffer);
-    ptr
+    register(vec![0_u8; len as usize].into_boxed_slice())
 }
 
 pub fn free(ptr: i32, len: i32) {
@@ -122,12 +116,31 @@ pub fn free(ptr: i32, len: i32) {
         return;
     }
 
-    unsafe {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            ptr as *mut u8,
-            len as usize,
-        )));
+    let removed = allocations()
+        .lock()
+        .expect("WASM allocations lock")
+        .remove(&ptr);
+    if let Some(bytes) = removed {
+        debug_assert_eq!(bytes.len(), len as usize, "WASM allocation length");
     }
+}
+
+fn allocations() -> &'static Mutex<HashMap<i32, Box<[u8]>>> {
+    // Exported C-style alloc/free functions have no instance receiver. This is
+    // the sole project-owned mutable global and is isolated to the WASM ABI;
+    // each WASM instance receives its own linear memory and allocation table.
+    static ALLOCATIONS: OnceLock<Mutex<HashMap<i32, Box<[u8]>>>> = OnceLock::new();
+    ALLOCATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register(mut bytes: Box<[u8]>) -> i32 {
+    let ptr = bytes.as_mut_ptr() as i32;
+    let replaced = allocations()
+        .lock()
+        .expect("WASM allocations lock")
+        .insert(ptr, bytes);
+    assert!(replaced.is_none(), "WASM allocation pointer collision");
+    ptr
 }
 
 fn pack_wasm_pair(ptr: i32, len: i32) -> i64 {
@@ -141,9 +154,8 @@ pub fn leak_bytes(bytes: Vec<u8>) -> i64 {
         return 0;
     }
 
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len() as i32;
-    let ptr = Box::into_raw(boxed) as *mut u8 as i32;
+    let len = bytes.len() as i32;
+    let ptr = register(bytes.into_boxed_slice());
     pack_wasm_pair(ptr, len)
 }
 
@@ -198,11 +210,14 @@ where
 {
     let stream =
         destream_json::encode(value).map_err(|err| TCError::bad_request(err.to_string()))?;
-    block_on(stream.try_fold(Vec::new(), |mut acc, chunk| async move {
-        acc.extend_from_slice(&chunk);
-        Ok(acc)
-    }))
-    .map_err(|err| TCError::bad_request(err.to_string()))
+    stream
+        .try_fold(Vec::new(), |mut acc, chunk| async move {
+            acc.extend_from_slice(&chunk);
+            Ok(acc)
+        })
+        .now_or_never()
+        .ok_or_else(|| TCError::internal("WASM JSON encoder yielded across the synchronous ABI"))?
+        .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
 fn decode_json_bytes<T>(context: T::Context, bytes: Vec<u8>) -> TCResult<T>
@@ -210,7 +225,9 @@ where
     T: de::FromStream,
 {
     let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(bytes))]);
-    block_on(destream_json::try_decode(context, stream))
+    destream_json::try_decode(context, stream)
+        .now_or_never()
+        .ok_or_else(|| TCError::internal("WASM JSON decoder yielded across the synchronous ABI"))?
         .map_err(|err| TCError::bad_request(err.to_string()))
 }
 
@@ -219,15 +236,26 @@ where
     T: de::FromStream,
 {
     let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::copy_from_slice(bytes))]);
-    block_on(destream_json::try_decode(context, stream)).map_err(|err| err.to_string())
+    destream_json::try_decode(context, stream)
+        .now_or_never()
+        .ok_or_else(|| "WASM JSON decoder yielded across the synchronous ABI".to_string())?
+        .map_err(|err| err.to_string())
 }
 
-fn read_bytes(ptr: i32, len: i32) -> Vec<u8> {
+fn read_bytes(ptr: i32, len: i32) -> TCResult<Vec<u8>> {
     if ptr == 0 || len <= 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    unsafe { slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() }
+    let allocations = allocations().lock().expect("WASM allocations lock");
+    let bytes = allocations
+        .get(&ptr)
+        .ok_or_else(|| TCError::bad_request("unknown WASM allocation"))?;
+    if bytes.len() != len as usize {
+        return Err(TCError::bad_request("invalid WASM allocation length"));
+    }
+
+    Ok(bytes.to_vec())
 }
 
 fn decode_header_bytes(bytes: &[u8]) -> TCResult<TxnHeader> {
@@ -245,6 +273,31 @@ fn encode_error(err: TCError) -> Vec<u8> {
     .unwrap_or_else(|_| br#"{"error":"internal"}"#.to_vec())
 }
 
+macro_rules! define_wasm_handler {
+    ($trait_name:ident, $method:ident) => {
+        pub trait $trait_name<Txn> {
+            type Request;
+            type Response;
+            type Fut<'a>: std::future::Future<Output = TCResult<Self::Response>> + Send + 'a
+            where
+                Self: 'a,
+                Txn: 'a,
+                Self::Request: 'a;
+
+            fn $method<'a>(
+                &'a self,
+                txn: &'a Txn,
+                request: Self::Request,
+            ) -> TCResult<Self::Fut<'a>>;
+        }
+    };
+}
+
+define_wasm_handler!(WasmGet, get);
+define_wasm_handler!(WasmPut, put);
+define_wasm_handler!(WasmPost, post);
+define_wasm_handler!(WasmDelete, delete);
+
 macro_rules! define_dispatch {
     (
         $dispatch_fn:ident,
@@ -253,7 +306,7 @@ macro_rules! define_dispatch {
         $handler_trait:ident,
         $handler_method:ident,
     ) => {
-        pub fn $dispatch_fn<H, Txn, Req, Res>(
+        pub fn $dispatch_fn<H, Req, Res>(
             handler: &H,
             header_ptr: i32,
             header_len: i32,
@@ -261,14 +314,7 @@ macro_rules! define_dispatch {
             body_len: i32,
         ) -> i64
         where
-            Txn: WasmTransaction,
-            H: tc_ir::$handler_trait<
-                    Txn,
-                    Request = Req,
-                    RequestContext = (),
-                    Response = Res,
-                    Error = TCError,
-                >,
+            H: $handler_trait<TxnHeader, Request = Req, Response = Res>,
             Req: WasmRequest,
             Res: WasmResponse,
         {
@@ -279,7 +325,7 @@ macro_rules! define_dispatch {
             }
         }
 
-        fn $try_dispatch_fn<H, Txn, Req, Res>(
+        fn $try_dispatch_fn<H, Req, Res>(
             handler: &H,
             header_ptr: i32,
             header_len: i32,
@@ -287,44 +333,32 @@ macro_rules! define_dispatch {
             body_len: i32,
         ) -> TCResult<Vec<u8>>
         where
-            Txn: WasmTransaction,
-            H: tc_ir::$handler_trait<
-                    Txn,
-                    Request = Req,
-                    RequestContext = (),
-                    Response = Res,
-                    Error = TCError,
-                >,
+            H: $handler_trait<TxnHeader, Request = Req, Response = Res>,
             Req: WasmRequest,
             Res: WasmResponse,
         {
-            let header_bytes = read_bytes(header_ptr, header_len);
-            let body_bytes = read_bytes(body_ptr, body_len);
+            let header_bytes = read_bytes(header_ptr, header_len)?;
+            let body_bytes = read_bytes(body_ptr, body_len)?;
             $try_dispatch_bytes_fn(handler, &header_bytes, &body_bytes)
         }
 
-        fn $try_dispatch_bytes_fn<H, Txn, Req, Res>(
+        fn $try_dispatch_bytes_fn<H, Req, Res>(
             handler: &H,
             header_bytes: &[u8],
             body_bytes: &[u8],
         ) -> TCResult<Vec<u8>>
         where
-            Txn: WasmTransaction,
-            H: tc_ir::$handler_trait<
-                    Txn,
-                    Request = Req,
-                    RequestContext = (),
-                    Response = Res,
-                    Error = TCError,
-                >,
+            H: $handler_trait<TxnHeader, Request = Req, Response = Res>,
             Req: WasmRequest,
             Res: WasmResponse,
         {
             let header = decode_header_bytes(header_bytes)?;
-            let txn = Txn::from_wasm_header(header)?;
+            let txn = header;
             let request = Req::decode(body_bytes)?;
             let fut = handler.$handler_method(&txn, request)?;
-            let response = block_on(fut)?;
+            let response = fut.now_or_never().ok_or_else(|| {
+                TCError::internal("WASM handler yielded across the synchronous ABI")
+            })??;
             response.encode()
         }
     };
@@ -334,7 +368,7 @@ define_dispatch!(
     dispatch_get,
     try_dispatch_get,
     try_dispatch_get_bytes,
-    HandleGet,
+    WasmGet,
     get,
 );
 
@@ -342,7 +376,7 @@ define_dispatch!(
     dispatch_put,
     try_dispatch_put,
     try_dispatch_put_bytes,
-    HandlePut,
+    WasmPut,
     put,
 );
 
@@ -350,7 +384,7 @@ define_dispatch!(
     dispatch_post,
     try_dispatch_post,
     try_dispatch_post_bytes,
-    HandlePost,
+    WasmPost,
     post,
 );
 
@@ -358,71 +392,74 @@ define_dispatch!(
     dispatch_delete,
     try_dispatch_delete,
     try_dispatch_delete_bytes,
-    HandleDelete,
+    WasmDelete,
     delete,
 );
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::pin::Pin;
+    use std::str::FromStr;
 
     use futures::Future;
     use pathlink::Link;
-    use std::{pin::Pin, str::FromStr};
-    use tc_ir::{Claim, NetworkTime, TxnHeader, TxnId};
+    use tc_ir::{Claim, NetworkTime, Transaction, TxnHeader, TxnId};
     use umask::Mode;
 
-    #[derive(Clone)]
-    struct FakeTxn {
-        header: TxnHeader,
-    }
-
-    impl tc_ir::Transaction for FakeTxn {
-        fn id(&self) -> TxnId {
-            self.header.id()
-        }
-
-        fn timestamp(&self) -> NetworkTime {
-            self.header.timestamp()
-        }
-
-        fn claim(&self) -> &Claim {
-            self.header.claim()
-        }
-    }
-
-    impl WasmTransaction for FakeTxn {
-        fn from_wasm_header(header: TxnHeader) -> TCResult<Self> {
-            Ok(Self { header })
-        }
-    }
+    use super::*;
 
     struct VerbHandler;
 
-    impl tc_ir::HandlePut<FakeTxn> for VerbHandler {
-        type Request = Value;
-        type RequestContext = ();
-        type Response = Value;
-        type Error = TCError;
-        type Fut<'a> =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+    #[test]
+    fn allocation_registry_validates_pointer_ownership_and_length() {
+        let ptr = alloc(4);
+        assert_eq!(read_bytes(ptr, 4).expect("allocated bytes"), vec![0; 4]);
+        assert!(read_bytes(ptr, 3).is_err());
 
-        fn put<'a>(&'a self, _txn: &'a FakeTxn, request: Self::Request) -> TCResult<Self::Fut<'a>> {
+        free(ptr, 4);
+        assert!(read_bytes(ptr, 4).is_err());
+    }
+
+    struct TestTxn {
+        claim: Claim,
+    }
+
+    impl Transaction for TestTxn {
+        fn id(&self) -> TxnId {
+            TxnId::from_parts(NetworkTime::from_nanos(1), 7)
+        }
+
+        fn timestamp(&self) -> NetworkTime {
+            NetworkTime::from_nanos(1)
+        }
+
+        fn claim(&self) -> &Claim {
+            &self.claim
+        }
+    }
+
+    impl WasmPut<TxnHeader> for VerbHandler {
+        type Request = Value;
+        type Response = Value;
+        type Fut<'a> = Pin<Box<dyn Future<Output = TCResult<Self::Response>> + Send + 'a>>;
+
+        fn put<'a>(
+            &'a self,
+            _txn: &'a TxnHeader,
+            request: Self::Request,
+        ) -> TCResult<Self::Fut<'a>> {
             Ok(Box::pin(async move { Ok(request) }))
         }
     }
 
-    impl tc_ir::HandlePost<FakeTxn> for VerbHandler {
+    impl WasmPost<TxnHeader> for VerbHandler {
         type Request = Value;
-        type RequestContext = ();
         type Response = Value;
-        type Error = TCError;
-        type Fut<'a> =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+        type Fut<'a> = Pin<Box<dyn Future<Output = TCResult<Self::Response>> + Send + 'a>>;
 
         fn post<'a>(
             &'a self,
-            _txn: &'a FakeTxn,
+            _txn: &'a TxnHeader,
             request: Self::Request,
         ) -> TCResult<Self::Fut<'a>> {
             Ok(Box::pin(async move {
@@ -431,17 +468,14 @@ mod tests {
         }
     }
 
-    impl tc_ir::HandleDelete<FakeTxn> for VerbHandler {
+    impl WasmDelete<TxnHeader> for VerbHandler {
         type Request = Value;
-        type RequestContext = ();
         type Response = Value;
-        type Error = TCError;
-        type Fut<'a> =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+        type Fut<'a> = Pin<Box<dyn Future<Output = TCResult<Self::Response>> + Send + 'a>>;
 
         fn delete<'a>(
             &'a self,
-            _txn: &'a FakeTxn,
+            _txn: &'a TxnHeader,
             request: Self::Request,
         ) -> TCResult<Self::Fut<'a>> {
             Ok(Box::pin(async move {
@@ -452,8 +486,7 @@ mod tests {
 
     fn txn_header_bytes() -> Vec<u8> {
         let claim = Claim::new(Link::from_str("/lib").expect("claim link"), Mode::all());
-        let id = TxnId::from_parts(NetworkTime::from_nanos(1), 7);
-        let header = TxnHeader::new(id, NetworkTime::from_nanos(1), claim);
+        let header = TxnHeader::from_transaction(&TestTxn { claim });
         encode_json_bytes(header).expect("header json")
     }
 
@@ -464,12 +497,9 @@ mod tests {
         let request = Value::from(42u64);
         let body_bytes = encode_json_bytes(request.clone()).expect("body json");
 
-        let response_bytes = try_dispatch_put_bytes::<_, FakeTxn, Value, Value>(
-            &handler,
-            &header_bytes,
-            &body_bytes,
-        )
-        .expect("put response");
+        let response_bytes =
+            try_dispatch_put_bytes::<_, Value, Value>(&handler, &header_bytes, &body_bytes)
+                .expect("put response");
 
         let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
         assert_eq!(response, request);
@@ -482,12 +512,9 @@ mod tests {
         let request = Value::from("hello");
         let body_bytes = encode_json_bytes(request.clone()).expect("body json");
 
-        let response_bytes = try_dispatch_post_bytes::<_, FakeTxn, Value, Value>(
-            &handler,
-            &header_bytes,
-            &body_bytes,
-        )
-        .expect("post response");
+        let response_bytes =
+            try_dispatch_post_bytes::<_, Value, Value>(&handler, &header_bytes, &body_bytes)
+                .expect("post response");
 
         let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
         assert_eq!(response, Value::String(format!("post:{request:?}")));
@@ -500,12 +527,9 @@ mod tests {
         let request = Value::from("goodbye");
         let body_bytes = encode_json_bytes(request.clone()).expect("body json");
 
-        let response_bytes = try_dispatch_delete_bytes::<_, FakeTxn, Value, Value>(
-            &handler,
-            &header_bytes,
-            &body_bytes,
-        )
-        .expect("delete response");
+        let response_bytes =
+            try_dispatch_delete_bytes::<_, Value, Value>(&handler, &header_bytes, &body_bytes)
+                .expect("delete response");
 
         let response: Value = try_decode_json_slice((), &response_bytes).expect("decode response");
         assert_eq!(response, Value::String(format!("delete:{request:?}")));

@@ -5,6 +5,13 @@ compatible with the manifest format expected by Python clients and `tc-server`.
 
 ## Development guidelines
 
+- Keep the WASM ABI implementation free of `unsafe`. Retain exported allocations
+  in the checked allocation registry; never reconstruct a slice or allocation
+  from an unverified guest pointer.
+- Treat guest memory and serialized ABI buffers as explicitly bounded boundary
+  resources. Poll streams only when the guest/host consumer is ready, propagate
+  cancellation, and reject oversized or saturated work before materialization.
+
 - Maintain parity with the Python manifest schema (`Library.__json__`). WASM libraries
   must emit identical immutable attributes and `wasm_export` annotations or
   installation will fail. Update the README if the manifest shape changes.

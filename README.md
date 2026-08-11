@@ -2,47 +2,22 @@
 
 TinyChain WASM helper crate. It currently exports utilities used by WASM-targeted TinyChain libraries.
 
-The `example` module in `src/lib.rs` shows how to:
-
-1. Implement a minimal transaction type (`ExampleTxn`).
-2. Write a handler (`HelloHandler`) with typed inputs/outputs.
-3. Use `tc_ir::StaticLibrary` and the `tc_library_routes!` macro to build a runnable library via `hello_library()`.
+WASM libraries define typed handlers and route tables with `tc_ir`; the host
+passes the authenticated transaction header into the ABI at invocation time.
+Library code must not invent, default, or reconstruct a transaction context.
 
 When emitting a manifest for installation (e.g., via `/lib`), follow the existing TinyChain format: the JSON map returned by Python’s `Library.__json__` (defined in the TinyChain Python client) remains canonical. WASM libraries must produce the same structure (attributes serialized via `to_json`, immutable values only) and annotate each exported method with a `wasm_export` field pointing to the corresponding WASM export. `tc-server` will reject manifests that diverge from this format to preserve compatibility with existing clients.
 
 Run `cargo test -p tc-wasm` to see the example exercised end-to-end.
 
-## Hello WASM example
+## Building a WASM library
 
-A concrete WASM-ready library lives under `examples/hello_wasm.rs`. It reuses the
-same `ExampleTxn` + `HelloHandler` definitions from `tc-ir/examples/hello_library.rs`
-and only adds a tiny ABI shim provided by `tc_wasm::abi` (`tc_library_entry`,
-`alloc/free`, and the exported `hello` function). Build it with:
-
-```bash
-cargo build -p tc-wasm --example hello_wasm --target wasm32-unknown-unknown --release
-```
-
-This produces `target/wasm32-unknown-unknown/release/examples/hello_wasm.wasm`, which
-exports:
-
-- `tc_library_entry` – uses `manifest_bytes` + `RouteExport` to generate the manifest JSON
-  describing `/lib/example` with a single `/hello` route.
-- `alloc` / `free` – provided by `tc_wasm::abi` so every library shares the same
-  host-memory helpers.
-- `hello` – the actual TinyChain handler implemented via `HelloHandler`. It decodes the
-  JSON body into a Rust `String`, invokes the same `HandleGet` logic shown in the
-  `tc-ir` example, and serializes the response back to JSON.
-
-Install the resulting module via `/lib` (or the TinyChain Python client WASM
-installer helper) the same as any other TinyChain WASM artifact.
-
-To wrap your own library crate, expose a `StaticLibrary`, implement `WasmTransaction`
-for your transaction type (i.e., rebuild it from a `TxnHeader`), and export each route
-via `dispatch_get/dispatch_put/...` helpers. The ABI module takes care of decoding the
-request, awaiting the `Handle*` future, and encoding the response back to TinyChain so
-your WASM entry point stays as small as the native example. Keep imports grouped and
-formatted per the repo-wide `CODE_STYLE.md` whenever you add new modules or adapters.
+Expose a `LibraryModule<TxnHeader, _>` and each route through the `dispatch_get`,
+`dispatch_put`, `dispatch_post`, or `dispatch_delete` ABI helpers. The helpers
+decode the kernel-provided transaction header and request, invoke the handler,
+and encode the response. Application code receives the kernel-provided `TxnHeader`; it must never
+implement `Transaction`. Keep imports grouped and formatted per the repo-wide
+`CODE_STYLE.md` whenever you add new modules or adapters.
 
 ### Future portability: WASI
 
